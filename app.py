@@ -213,6 +213,9 @@ proteinMPNN = gr.Blocks()
 
 with proteinMPNN:
     gr.Markdown("# ProteinMPNN")
+    gr.Markdown("""Citation: **Robust deep learning based protein sequence design using ProteinMPNN** <br>
+Justas Dauparas, Ivan Anishchenko, Nathaniel Bennett, Hua Bai, Robert J. Ragotte, Lukas F. Milles, Basile I. M. Wicky, Alexis Courbet, Robbert J. de Haas, Neville Bethel, Philip J. Y. Leung, Timothy F. Huddy, Sam Pellock, Doug Tischer, Frederick Chan, Brian Koepnick, Hannah Nguyen, Alex Kang, Banumathi Sankaran, Asim Bera, Neil P. King, David Baker <br>
+bioRxiv 2022.06.03.494563; doi: [10.1101/2022.06.03.494563](https://doi.org/10.1101/2022.06.03.494563) <br><br> Server built by [@simonduerr](https://twitter.com/simonduerr) and hosted by Huggingface""")
     with gr.Tabs():
         with gr.TabItem("Input"):
             inp = gr.Textbox( placeholder="PDB Code or upload file below", label="Input structure"
