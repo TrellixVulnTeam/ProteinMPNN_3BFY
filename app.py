@@ -23,6 +23,7 @@ from protein_mpnn_utils import StructureDataset, StructureDatasetPDB, ProteinMPN
 import plotly.express as px
 import urllib
 
+print("Cuda available", torch.cuda.is_available())
 device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
 model_name="v_48_020"             # ProteinMPNN model name: v_48_002, v_48_010, v_48_020, v_48_030, v_32_002, v_32_010; v_32_020, v_32_030; v_48_010=version with 48 edges 0.10A noise
 backbone_noise=0.00               # Standard deviation of Gaussian noise to add to backbone atoms
