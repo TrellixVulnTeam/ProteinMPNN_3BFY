@@ -16,6 +16,7 @@ import copy
 import torch.nn as nn
 import torch.nn.functional as F
 import random
+import os
 import os.path
 from protein_mpnn_utils import (
     loss_nll,
@@ -32,18 +33,102 @@ from protein_mpnn_utils import (
 from protein_mpnn_utils import StructureDataset, StructureDatasetPDB, ProteinMPNN
 import plotly.express as px
 import urllib
+import jax.numpy as jnp
+import tensorflow as tf
 
-if "/home/user/app/alphafold" not in sys.path:
-    sys.path.append("/home/user/app/alphafold")
+if "/home/user/app/af_backprop" not in sys.path:
+    sys.path.append("/home/user/app/af_backprop")
 
+from utils import *
+
+# import libraries
+import colabfold as cf
 from alphafold.common import protein
 from alphafold.data import pipeline
-from alphafold.data import templates
-from alphafold.model import data
-from alphafold.model import config
-from alphafold.model import model
+from alphafold.model import data, config, model
+from alphafold.common import residue_constants
+
+
 import plotly.graph_objects as go
 import ray
+
+import re
+
+import numpy as np
+import jax
+
+tf.config.set_visible_devices([], "GPU")
+
+
+def chain_break(idx_res, Ls, length=200):
+    # Minkyung's code
+    # add big enough number to residue index to indicate chain breaks
+    L_prev = 0
+    for L_i in Ls[:-1]:
+        idx_res[L_prev + L_i :] += length
+        L_prev += L_i
+    return idx_res
+
+
+def setup_model(seq, model_name="model_1_ptm"):
+
+    # setup model
+    cfg = config.model_config("model_1_ptm")
+    cfg.model.num_recycle = 0
+    cfg.data.common.num_recycle = 0
+    cfg.data.eval.max_msa_clusters = 1
+    cfg.data.common.max_extra_msa = 1
+    cfg.data.eval.masked_msa_replace_fraction = 0
+    cfg.model.global_config.subbatch_size = None
+    model_params = data.get_model_haiku_params(model_name=model_name, data_dir=".")
+    model_runner = model.RunModel(cfg, model_params, is_training=False)
+    Ls = [len(s) for s in seq.split("/")]
+
+    seq = re.sub("[^A-Z]", "", seq.upper())
+    length = len(seq)
+    feature_dict = {
+        **pipeline.make_sequence_features(
+            sequence=seq, description="none", num_res=length
+        ),
+        **pipeline.make_msa_features(msas=[[seq]], deletion_matrices=[[[0] * length]]),
+    }
+    feature_dict["residue_index"] = chain_break(feature_dict["residue_index"], Ls)
+    inputs = model_runner.process_features(feature_dict, random_seed=0)
+
+    def runner(seq, opt):
+        # update sequence
+        inputs = opt["inputs"]
+        inputs.update(opt["prev"])
+        update_seq(seq, inputs)
+        update_aatype(inputs["target_feat"][..., 1:], inputs)
+
+        # mask prediction
+        mask = seq.sum(-1)
+        inputs["seq_mask"] = inputs["seq_mask"].at[:].set(mask)
+        inputs["msa_mask"] = inputs["msa_mask"].at[:].set(mask)
+        inputs["residue_index"] = jnp.where(mask == 1, inputs["residue_index"], 0)
+
+        # get prediction
+        key = jax.random.PRNGKey(0)
+        outputs = model_runner.apply(opt["params"], key, inputs)
+
+        prev = {
+            "init_msa_first_row": outputs["representations"]["msa_first_row"][None],
+            "init_pair": outputs["representations"]["pair"][None],
+            "init_pos": outputs["structure_module"]["final_atom_positions"][None],
+        }
+
+        aux = {
+            "final_atom_positions": outputs["structure_module"]["final_atom_positions"],
+            "final_atom_mask": outputs["structure_module"]["final_atom_mask"],
+            "plddt": get_plddt(outputs),
+            "pae": get_pae(outputs),
+            "inputs": inputs,
+            "prev": prev,
+        }
+        return aux
+
+    return jax.jit(runner), {"inputs": inputs, "params": model_params}
 
 
 def make_tied_positions_for_homomers(pdb_dict_list):
@@ -63,51 +148,47 @@ def make_tied_positions_for_homomers(pdb_dict_list):
     return my_dict
 
 
-def mk_mock_template(query_sequence):
-    """create blank template"""
-    ln = len(query_sequence)
-    output_templates_sequence = "-" * ln
-    templates_all_atom_positions = np.zeros(
-        (ln, templates.residue_constants.atom_type_num, 3)
-    )
-    templates_all_atom_masks = np.zeros((ln, templates.residue_constants.atom_type_num))
-    templates_aatype = templates.residue_constants.sequence_to_onehot(
-        output_templates_sequence, templates.residue_constants.HHBLITS_AA_TO_ID
-    )
-    template_features = {
-        "template_all_atom_positions": templates_all_atom_positions[None],
-        "template_all_atom_masks": templates_all_atom_masks[None],
-        "template_aatype": np.array(templates_aatype)[None],
-        "template_domain_names": [f"none".encode()],
-    }
-    return template_features
+def renumber(struc):
+    """Renumber residues consecutively and remove all hetero residues"""
+    resid = 0
+    residue_to_remove = []
+    chain_to_remove = []
+    for model in struc:
+        for chain in model:
+            for i, residue in enumerate(chain.get_residues()):
+                res_id = list(residue.id)
+                res_id[1] = resid
+                resid += 1
+                residue.id = tuple(res_id)
+                if residue.id[0] != " ":
+                    residue_to_remove.append((chain.id, residue.id))
+            if len(chain) == 0:
+                chain_to_remove.append(chain.id)
+    for residue in residue_to_remove:
+        struc[0][residue[0]].detach_child(residue[1])
+
+    for chain in chain_to_remove:
+        model.detach_child(chain)
+    return struc
 
 
-def align_structures(pdb1, pdb2):
+def align_structures(pdb1, pdb2, lenRes):
+    """Take two structure and superimpose pdb1 on pdb2"""
     import Bio.PDB
 
-    # Select what residues numbers you wish to align
-    # and put them in a list
-    # TODO Get residues from PDB file
-    atoms_to_be_aligned = range(start_id, end_id + 1)
+    # We use all residues
+    atoms_to_be_aligned = range(0, lenRes)
 
-    # Start the parser
     pdb_parser = Bio.PDB.PDBParser(QUIET=True)
-
     # Get the structures
-    ref_structure = pdb_parser.get_structure("reference", pdb1)
-    sample_structure = pdb_parser.get_structure("samle", pdb2)
-
+    ref_structure = pdb_parser.get_structure("samle", pdb2)
+    sample_structure = renumber(pdb_parser.get_structure("reference", pdb1))
     # Use the first model in the pdb-files for alignment
-    # Change the number 0 if you want to align to another structure
     ref_model = ref_structure[0]
     sample_model = sample_structure[0]
-
-    # Make a list of the atoms (in the structures) you wish to align.
-    # In this case we use CA atoms whose index is in the specified range
+    # Make a list of the atoms (in the structures) to align.
     ref_atoms = []
     sample_atoms = []
-
     # Iterate of all chains in the model in order to find all residues
     for ref_chain in ref_model:
         # Iterate of all residues in each model in order to find proper atoms
@@ -116,8 +197,6 @@ def align_structures(pdb1, pdb2):
             if ref_res.get_id()[1] in atoms_to_be_aligned:
                 # Append CA atom to list
                 ref_atoms.append(ref_res["CA"])
-
-    # Do the same for the sample structure
     for sample_chain in sample_model:
         for sample_res in sample_chain:
             if sample_res.get_id()[1] in atoms_to_be_aligned:
@@ -131,67 +210,59 @@ def align_structures(pdb1, pdb2):
     io = Bio.PDB.PDBIO()
     io.set_structure(sample_structure)
     io.save(f"{pdb1}_aligned.pdb")
-    return super_imposer.rms
+    return super_imposer.rms, f"{pdb1}_aligned.pdb"
 
 
-def predict_structure(prefix, feature_dict, model_runners, random_seed=0):
-    """Predicts structure using AlphaFold for the given sequence."""
-
-    # Run the models.
-    # currently we only run model1
-    plddts = {}
-    for model_name, model_runner in model_runners.items():
-        processed_feature_dict = model_runner.process_features(
-            feature_dict, random_seed=random_seed
-        )
-        prediction_result = model_runner.predict(processed_feature_dict)
-        b_factors = (
-            prediction_result["plddt"][:, None]
-            * prediction_result["structure_module"]["final_atom_mask"]
-        )
-        unrelaxed_protein = protein.from_prediction(
-            processed_feature_dict, prediction_result, b_factors
-        )
-        unrelaxed_pdb_path = f"/home/user/app/{prefix}_unrelaxed_{model_name}.pdb"
-        plddts[model_name] = prediction_result["plddt"]
-
-        print(f"{model_name} {plddts[model_name].mean()}")
-
-        with open(unrelaxed_pdb_path, "w") as f:
-            f.write(protein.to_pdb(unrelaxed_protein))
-    return plddts
+def save_pdb(outs, filename, LEN):
+    """save pdb coordinates"""
+    p = {
+        "residue_index": outs["inputs"]["residue_index"][0][:LEN],
+        "aatype": outs["inputs"]["aatype"].argmax(-1)[0][:LEN],
+        "atom_positions": outs["final_atom_positions"][:LEN],
+        "atom_mask": outs["final_atom_mask"][:LEN],
+    }
+    b_factors = 100.0 * outs["plddt"][:LEN, None] * p["atom_mask"]
+    p = protein.Protein(**p, b_factors=b_factors)
+    pdb_lines = protein.to_pdb(p)
+    with open(filename, "w") as f:
+        f.write(pdb_lines)
+    print(os.listdir(), os.getcwd())
 
 
 @ray.remote(num_gpus=1, max_calls=1)
-def run_alphafold(startsequence):
-    model_runners = {}
-    models = ["model_1"]  # ,"model_2","model_3","model_4","model_5"]
-    for model_name in models:
-        model_config = config.model_config(model_name)
-        model_config.data.eval.num_ensemble = 1
-        model_params = data.get_model_haiku_params(
-            model_name=model_name, data_dir="/home/user/app/"
-        )
-        model_runner = model.RunModel(model_config, model_params)
-        model_runners[model_name] = model_runner
-    query_sequence = startsequence.replace("\n", "")
+def run_alphafold(sequence):
+    recycles = 3
+    RUNNER, OPT = setup_model(sequence)
 
-    feature_dict = {
-        **pipeline.make_sequence_features(
-            sequence=query_sequence, description="none", num_res=len(query_sequence)
-        ),
-        **pipeline.make_msa_features(
-            msas=[[query_sequence]], deletion_matrices=[[[0] * len(query_sequence)]]
-        ),
-        **mk_mock_template(query_sequence),
+    SEQ = re.sub("[^A-Z]", "", sequence.upper())
+    MAX_LEN = len(SEQ)
+    LEN = len(SEQ)
+
+    x = np.array([residue_constants.restype_order.get(aa, -1) for aa in SEQ])
+    x = np.pad(x, [0, MAX_LEN - LEN], constant_values=-1)
+    x = jax.nn.one_hot(x, 20)
+
+    OPT["prev"] = {
+        "init_msa_first_row": np.zeros([1, MAX_LEN, 256]),
+        "init_pair": np.zeros([1, MAX_LEN, MAX_LEN, 128]),
+        "init_pos": np.zeros([1, MAX_LEN, 37, 3]),
     }
-    print(feature_dict["residue_index"])
-    plddts = predict_structure("test", feature_dict, model_runners)
-    print("AF2 done")
-    return plddts["model_1"]
+
+    positions = []
+    plddts = []
+    for r in range(recycles + 1):
+        outs = RUNNER(x, OPT)
+        outs = jax.tree_map(lambda x: np.asarray(x), outs)
+        positions.append(outs["prev"]["init_pos"][0, :LEN])
+        plddts.append(outs["plddt"][:LEN])
+        OPT["prev"] = outs["prev"]
+        if recycles > 0:
+            print(r, plddts[-1].mean())
+    save_pdb(outs, "out.pdb", LEN)
+    num_res = int(outs["inputs"]["aatype"][0].sum())
+    return outs["plddt"], outs["pae"], num_res
 
 
-print("Cuda available", torch.cuda.is_available())
 device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
 model_name = "v_48_020"  # ProteinMPNN model name: v_48_002, v_48_010, v_48_020, v_48_030, v_32_002, v_32_010; v_32_020, v_32_030; v_48_010=version with 48 edges 0.10A noise
 backbone_noise = 0.00  # Standard deviation of Gaussian noise to add to backbone atoms
@@ -223,11 +294,6 @@ model = ProteinMPNN(
 model.to(device)
 model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
-
-
-import re
-
-import numpy as np
 
 
 def get_pdb(pdb_code="", filepath=""):
@@ -556,31 +622,38 @@ def update(inp, file, designed_chain, fixed_chain, homomer, num_seqs, sampling_t
         fig_tadjusted,
         gr.File.update(value="all_log_probs_concat.csv", visible=True),
         gr.File.update(value="all_probs_concat.csv", visible=True),
+        pdb_path,
     )
 
 
-def update_AF(startsequence):
+def update_AF(startsequence, pdb):
 
     # # run alphafold using ray
-    plddts = ray.get(run_alphafold.remote(startsequence))
-    print(plddts)
+    plddts, pae, num_res = ray.get(run_alphafold.remote(startsequence))
     x = np.arange(10)
 
-    plotAF = go.Figure(
+    plotAF_plddt = go.Figure(
         data=go.Scatter(
             x=np.arange(len(plddts)),
             y=plddts,
             hovertemplate="<i>pLDDT</i>: %{y:.2f} <br><i>Residue index:</i> %{x}",
         )
     )
-    plotAF.update_layout(
+    plotAF_plddt.update_layout(
         title="pLDDT",
         xaxis_title="Residue index",
         yaxis_title="pLDDT",
         height=500,
         template="simple_white",
     )
-    return molecule(f"test_unrelaxed_model_1.pdb"), plotAF
+
+    plotAF_pae = px.imshow(
+        pae,
+        labels=dict(x="Scored residue", y="Aligned residue", color=""),
+    )
+    plotAF_pae.update_layout(title="Predicted Aligned Error", template="simple_white")
+
+    return molecule(pdb, "af_backprop/out.pdb", num_res), plotAF_plddt, plotAF_pae
 
 
 def read_mol(molpath):
@@ -592,8 +665,12 @@ def read_mol(molpath):
     return mol
 
 
-def molecule(pdb):
+def molecule(pdb, afpdb, num_res):
+
+    rms, aligned_pdb = align_structures(pdb, afpdb, num_res)
+
     mol = read_mol(pdb)
+    pred_mol = read_mol(aligned_pdb)
     x = (
         """<!DOCTYPE html>
         <html>
@@ -677,9 +754,13 @@ select{
                 viewer = $3Dmol.createViewer( element, config );
                 viewer.ui.initiateUI();
                 let data = `"""
+        + pred_mol
+        + """`  
+                let pdb = `"""
         + mol
         + """`  
                 viewer.addModel( data, "pdb" );
+                viewer.addModel( pdb, "pdb" );
                 //AlphaFold code from https://gist.github.com/piroyon/30d1c1099ad488a7952c3b21a5bebc96
                 let colorAlpha = function (atom) {
                     if (atom.b < 50) {
@@ -721,7 +802,9 @@ select{
                     }
                 });
                 $("#download").click(function () {
-                    download("gradioFold_model1.pdb", data);
+                    download(\""""
+        + aligned_pdb
+        + """\", data);
                 })
         });
         function download(filename, text) {
@@ -833,16 +916,17 @@ with proteinMPNN:
             plot_tadjusted = gr.Plot()
             all_probs = gr.File(visible=False)
         with gr.TabItem("Structure validation w/ AF2"):
-            gr.Markdown("Coming soon")
-            # with gr.Row():
-            #     chosen_seq = gr.Textbox(
-            #         label="Copy and paste a sequence for validation"
-            #     )
-            #     btnAF = gr.Button("Run AF2 on sequence")
-            # with gr.Row():
-            #     mol = gr.HTML()
-            #     plotAF = gr.Plot(label="pLDDT")
-
+            # gr.Markdown("Coming soon")
+            with gr.Row():
+                chosen_seq = gr.Textbox(
+                    label="Copy and paste a sequence for validation"
+                )
+                btnAF = gr.Button("Run AF2 on sequence")
+            mol = gr.HTML()
+            with gr.Row():
+                plotAF_plddt = gr.Plot(label="pLDDT")
+                plotAF_pae = gr.Plot(label="PAE")
+    file = gr.Variable()
     btn.click(
         fn=update,
         inputs=[
@@ -854,13 +938,13 @@ with proteinMPNN:
             num_seqs,
             sampling_temp,
         ],
-        outputs=[out, plot, plot_tadjusted, all_log_probs, all_probs],
+        outputs=[out, plot, plot_tadjusted, all_log_probs, all_probs, file],
     )
-    # btnAF.click(
-    #     fn=update_AF,
-    #     inputs=[chosen_seq],
-    #     outputs=[mol, plotAF],
-    # )
+    btnAF.click(
+        fn=update_AF,
+        inputs=[chosen_seq, file],
+        outputs=[mol, plotAF_plddt, plotAF_pae],
+    )
     examples.click(fn=set_examples, inputs=examples, outputs=examples.components)
     gr.Markdown(
         """Citation: **Robust deep learning based protein sequence design using ProteinMPNN** <br>
@@ -869,6 +953,6 @@ bioRxiv 2022.06.03.494563; doi: [10.1101/2022.06.03.494563](https://doi.org/10.1
     )
 
 
-ray.init(runtime_env={"working_dir": "./alphafold"})
+ray.init(runtime_env={"working_dir": "./af_backprop"})
 
 proteinMPNN.launch(share=True)
