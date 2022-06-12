@@ -953,6 +953,6 @@ bioRxiv 2022.06.03.494563; doi: [10.1101/2022.06.03.494563](https://doi.org/10.1
     )
 
 
-ray.init(runtime_env={"working_dir": "./af_backprop"})
+ray.init(runtime_env={"working_dir": "./"})
 
-proteinMPNN.launch(share=True)
+proteinMPNN.launch()
