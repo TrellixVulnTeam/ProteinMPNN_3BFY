@@ -20,19 +20,7 @@ import torch.nn.functional as F
 import random
 import os
 import os.path
-from protein_mpnn_utils import (
-    loss_nll,
-    loss_smoothed,
-    gather_edges,
-    gather_nodes,
-    gather_nodes_t,
-    cat_neighbors_nodes,
-    _scores,
-    _S_to_seq,
-    tied_featurize,
-    parse_PDB,
-)
-from protein_mpnn_utils import StructureDataset, StructureDatasetPDB, ProteinMPNN
+
 import plotly.express as px
 import urllib
 import jax.numpy as jnp
@@ -203,7 +191,7 @@ def save_pdb(outs, filename, LEN):
         f.write(pdb_lines)
 
 
-# @ray.remote(num_gpus=1, max_calls=1)
+@ray.remote(num_gpus=1, max_calls=1)
 def run_alphafold(sequence, num_recycles):
     recycles = num_recycles
     RUNNER, OPT = setup_af(sequence)
@@ -232,8 +220,10 @@ def run_alphafold(sequence, num_recycles):
         OPT["prev"] = outs["prev"]
         if recycles > 0:
             print(r, plddts[-1].mean())
-    save_pdb(outs, "out.pdb", LEN)
-
+    if os.path.exists("/home/duerr/phd/08_Code/ProteinMPNN"):
+        save_pdb(outs, "/home/duerr/phd/08_Code/ProteinMPNN/out.pdb", LEN)
+    else:
+        save_pdb(outs, "/home/user/app/out.pdb", LEN)
     return plddts, outs["pae"], LEN
 
 
@@ -246,6 +236,20 @@ else:
 
 
 def setup_proteinmpnn(model_name="v_48_020", backbone_noise=0.00):
+    from protein_mpnn_utils import (
+        loss_nll,
+        loss_smoothed,
+        gather_edges,
+        gather_nodes,
+        gather_nodes_t,
+        cat_neighbors_nodes,
+        _scores,
+        _S_to_seq,
+        tied_featurize,
+        parse_PDB,
+    )
+    from protein_mpnn_utils import StructureDataset, StructureDatasetPDB, ProteinMPNN
+
     device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
     # ProteinMPNN model name: v_48_002, v_48_010, v_48_020, v_48_030, v_32_002, v_32_010; v_32_020, v_32_030; v_48_010=version with 48 edges 0.10A noise
     # Standard deviation of Gaussian noise to add to backbone atoms
@@ -298,6 +302,20 @@ def update(
     model_name,
     backbone_noise,
 ):
+    from protein_mpnn_utils import (
+        loss_nll,
+        loss_smoothed,
+        gather_edges,
+        gather_nodes,
+        gather_nodes_t,
+        cat_neighbors_nodes,
+        _scores,
+        _S_to_seq,
+        tied_featurize,
+        parse_PDB,
+    )
+    from protein_mpnn_utils import StructureDataset, StructureDatasetPDB, ProteinMPNN
+
     pdb_path = get_pdb(pdb_code=inp, filepath=file)
 
     if pdb_path == None:
@@ -655,9 +673,20 @@ def update(
 def update_AF(startsequence, pdb, num_recycles):
 
     # # run alphafold using ray
-    plddts, pae, num_res = run_alphafold(
-        startsequence, num_recycles
-    )  # ray.get(run_alphafold.remote(startsequence))
+    # plddts, pae, num_res = run_alphafold(
+    #    startsequence, num_recycles
+    # )
+    if len(startsequence) > 700:
+        return (
+            """
+            <div class="p-4 mb-4 text-sm text-yellow-700 bg-orange-50 rounded-lg" role="alert">
+  <span class="font-medium">Sorry!</span> Currently only small proteins can be run in the server in order to reduce wait time. Try a protein <700 aa. Bigger proteins you can run on <a href="https://github.com/sokrypton/colabfold">ColabFold</a>
+</div>
+""",
+            plt.figure(),
+            plt.figure(),
+        )
+    plddts, pae, num_res = ray.get(run_alphafold.remote(startsequence, num_recycles))
     x = np.arange(10)
     plots = []
     for recycle, plddts_val in enumerate(plddts):
@@ -784,7 +813,7 @@ select{
 <div class="text-sm">
 <div> RMSD AlphaFold vs. native: """
         + f"{rms:.2f}"
-        + """Å</div>
+        + """Å computed using CEAlign on the aligned fragment</div>
                             <div class="font-medium mt-4"><b>AlphaFold model confidence:</b></div>
                             <div class="flex space-x-2 py-1"><span class="w-4 h-4"
                                     style="background-color: rgb(0, 83, 214);">&nbsp;</span><span class="legendlabel">Very high
@@ -1073,6 +1102,6 @@ bioRxiv 2022.06.03.494563; doi: [10.1101/2022.06.03.494563](https://doi.org/10.1
     )
 
 
-# ray.init(runtime_env={"working_dir": "./af_backprop"})
+ray.init(runtime_env={"working_dir": "./af_backprop"})
 
 proteinMPNN.launch(share=True, debug=True)
