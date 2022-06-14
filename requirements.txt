@@ -1,5 +1,5 @@
 absl-py==0.13.0
-biopython==1.79
+git+https://github.com/biopython/biopython.git
 chex==0.0.7
 dm-haiku==0.0.5
 dm-tree==0.1.6
@@ -17,5 +17,6 @@ plotly
 GPUtil
 ray
 tqdm
+gradio==3.0.11
 protobuf<4
 -f https://storage.googleapis.com/jax-releases/jax_releases.html

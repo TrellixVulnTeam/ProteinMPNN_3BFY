@@ -4,6 +4,8 @@ import gradio as gr
 
 sys.path.append("/home/user/app/ProteinMPNN/vanilla_proteinmpnn")
 
+sys.path.append("/home/duerr/phd/08_Code/ProteinMPNN/ProteinMPNN/vanilla_proteinmpnn")
+
 import matplotlib.pyplot as plt
 import shutil
 import warnings
@@ -39,13 +41,18 @@ import tensorflow as tf
 if "/home/user/app/af_backprop" not in sys.path:
     sys.path.append("/home/user/app/af_backprop")
 
+# local only
+if "/home/duerr/phd/08_Code/ProteinMPNN/af_backprop" not in sys.path:
+    sys.path.append("/home/duerr/phd/08_Code/ProteinMPNN/af_backprop")
+
 from utils import *
 
 # import libraries
 import colabfold as cf
 from alphafold.common import protein
 from alphafold.data import pipeline
-from alphafold.model import data, config, model
+from alphafold.model import data, config
+from alphafold.model import model as afmodel
 from alphafold.common import residue_constants
 
 
@@ -70,18 +77,28 @@ def chain_break(idx_res, Ls, length=200):
     return idx_res
 
 
-def setup_model(seq, model_name="model_1_ptm"):
+def clear_mem():
+    backend = jax.lib.xla_bridge.get_backend()
+    for buf in backend.live_buffers():
+        buf.delete()
 
+
+def setup_af(seq, model_name="model_5_ptm"):
+    clear_mem()
     # setup model
-    cfg = config.model_config("model_1_ptm")
+    cfg = config.model_config("model_5_ptm")
     cfg.model.num_recycle = 0
     cfg.data.common.num_recycle = 0
     cfg.data.eval.max_msa_clusters = 1
     cfg.data.common.max_extra_msa = 1
     cfg.data.eval.masked_msa_replace_fraction = 0
     cfg.model.global_config.subbatch_size = None
-    model_params = data.get_model_haiku_params(model_name=model_name, data_dir=".")
-    model_runner = model.RunModel(cfg, model_params, is_training=False)
+    if os.path.exists("/home/duerr"):
+        datadir = "/home/duerr/phd/08_Code/ProteinMPNN"
+    else:
+        datadir = "/home/user/app/"
+    model_params = data.get_model_haiku_params(model_name=model_name, data_dir=datadir)
+    model_runner = afmodel.RunModel(cfg, model_params, is_training=False)
     Ls = [len(s) for s in seq.split("/")]
 
     seq = re.sub("[^A-Z]", "", seq.upper())
@@ -148,69 +165,27 @@ def make_tied_positions_for_homomers(pdb_dict_list):
     return my_dict
 
 
-def renumber(struc):
-    """Renumber residues consecutively and remove all hetero residues"""
-    resid = 0
-    residue_to_remove = []
-    chain_to_remove = []
-    for model in struc:
-        for chain in model:
-            for i, residue in enumerate(chain.get_residues()):
-                res_id = list(residue.id)
-                res_id[1] = resid
-                resid += 1
-                residue.id = tuple(res_id)
-                if residue.id[0] != " ":
-                    residue_to_remove.append((chain.id, residue.id))
-            if len(chain) == 0:
-                chain_to_remove.append(chain.id)
-    for residue in residue_to_remove:
-        struc[0][residue[0]].detach_child(residue[1])
-
-    for chain in chain_to_remove:
-        model.detach_child(chain)
-    return struc
-
-
 def align_structures(pdb1, pdb2, lenRes):
     """Take two structure and superimpose pdb1 on pdb2"""
     import Bio.PDB
-
-    # We use all residues
-    atoms_to_be_aligned = range(0, lenRes)
+    import subprocess
 
     pdb_parser = Bio.PDB.PDBParser(QUIET=True)
     # Get the structures
-    ref_structure = pdb_parser.get_structure("samle", pdb2)
-    sample_structure = renumber(pdb_parser.get_structure("reference", pdb1))
-    # Use the first model in the pdb-files for alignment
-    ref_model = ref_structure[0]
-    sample_model = sample_structure[0]
-    # Make a list of the atoms (in the structures) to align.
-    ref_atoms = []
-    sample_atoms = []
-    # Iterate of all chains in the model in order to find all residues
-    for ref_chain in ref_model:
-        # Iterate of all residues in each model in order to find proper atoms
-        for ref_res in ref_chain:
-            # Check if residue number ( .get_id() ) is in the list
-            if ref_res.get_id()[1] in atoms_to_be_aligned:
-                # Append CA atom to list
-                ref_atoms.append(ref_res["CA"])
-    for sample_chain in sample_model:
-        for sample_res in sample_chain:
-            if sample_res.get_id()[1] in atoms_to_be_aligned:
-                sample_atoms.append(sample_res["CA"])
+    ref_structure = pdb_parser.get_structure("samle", pdb1)
+    sample_structure = pdb_parser.get_structure("reference", pdb2)
 
-    # Now we initiate the superimposer:
-    super_imposer = Bio.PDB.Superimposer()
-    super_imposer.set_atoms(ref_atoms, sample_atoms)
-    super_imposer.apply(sample_model.get_atoms())
+    aligner = Bio.PDB.CEAligner()
+    aligner.set_reference(ref_structure)
+    aligner.align(sample_structure)
 
     io = Bio.PDB.PDBIO()
-    io.set_structure(sample_structure)
-    io.save(f"{pdb1}_aligned.pdb")
-    return super_imposer.rms, f"{pdb1}_aligned.pdb"
+    io.set_structure(ref_structure)
+    io.save(f"reference.pdb")
+    # Doing this to get around biopython CEALIGN bug
+    subprocess.call("pymol -c -Q -r cealign.pml", shell=True)
+
+    return aligner.rms, "reference.pdb", "out_aligned.pdb"
 
 
 def save_pdb(outs, filename, LEN):
@@ -226,13 +201,12 @@ def save_pdb(outs, filename, LEN):
     pdb_lines = protein.to_pdb(p)
     with open(filename, "w") as f:
         f.write(pdb_lines)
-    print(os.listdir(), os.getcwd())
 
 
-@ray.remote(num_gpus=1, max_calls=1)
-def run_alphafold(sequence):
-    recycles = 3
-    RUNNER, OPT = setup_model(sequence)
+# @ray.remote(num_gpus=1, max_calls=1)
+def run_alphafold(sequence, num_recycles):
+    recycles = num_recycles
+    RUNNER, OPT = setup_af(sequence)
 
     SEQ = re.sub("[^A-Z]", "", sequence.upper())
     MAX_LEN = len(SEQ)
@@ -259,53 +233,80 @@ def run_alphafold(sequence):
         if recycles > 0:
             print(r, plddts[-1].mean())
     save_pdb(outs, "out.pdb", LEN)
-    num_res = int(outs["inputs"]["aatype"][0].sum())
-    return outs["plddt"], outs["pae"], num_res
+
+    return plddts, outs["pae"], LEN
 
 
-device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
-model_name = "v_48_020"  # ProteinMPNN model name: v_48_002, v_48_010, v_48_020, v_48_030, v_32_002, v_32_010; v_32_020, v_32_030; v_48_010=version with 48 edges 0.10A noise
-backbone_noise = 0.00  # Standard deviation of Gaussian noise to add to backbone atoms
+if os.path.exists("/home/duerr/phd/08_Code/ProteinMPNN"):
+    path_to_model_weights = "/home/duerr/phd/08_Code/ProteinMPNN/ProteinMPNN/vanilla_proteinmpnn/vanilla_model_weights"
+else:
+    path_to_model_weights = (
+        "/home/user/app/ProteinMPNN/vanilla_proteinmpnn/vanilla_model_weights"
+    )
 
-path_to_model_weights = (
-    "/home/user/app/ProteinMPNN/vanilla_proteinmpnn/vanilla_model_weights"
-)
-hidden_dim = 128
-num_layers = 3
-model_folder_path = path_to_model_weights
-if model_folder_path[-1] != "/":
-    model_folder_path = model_folder_path + "/"
-checkpoint_path = model_folder_path + f"{model_name}.pt"
 
-checkpoint = torch.load(checkpoint_path, map_location=device)
+def setup_proteinmpnn(model_name="v_48_020", backbone_noise=0.00):
+    device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
+    # ProteinMPNN model name: v_48_002, v_48_010, v_48_020, v_48_030, v_32_002, v_32_010; v_32_020, v_32_030; v_48_010=version with 48 edges 0.10A noise
+    # Standard deviation of Gaussian noise to add to backbone atoms
+    hidden_dim = 128
+    num_layers = 3
+    model_folder_path = path_to_model_weights
+    if model_folder_path[-1] != "/":
+        model_folder_path = model_folder_path + "/"
+    checkpoint_path = model_folder_path + f"{model_name}.pt"
 
-noise_level_print = checkpoint["noise_level"]
+    checkpoint = torch.load(checkpoint_path, map_location=device)
 
-model = ProteinMPNN(
-    num_letters=21,
-    node_features=hidden_dim,
-    edge_features=hidden_dim,
-    hidden_dim=hidden_dim,
-    num_encoder_layers=num_layers,
-    num_decoder_layers=num_layers,
-    augment_eps=backbone_noise,
-    k_neighbors=checkpoint["num_edges"],
-)
-model.to(device)
-model.load_state_dict(checkpoint["model_state_dict"])
-model.eval()
+    noise_level_print = checkpoint["noise_level"]
+
+    model = ProteinMPNN(
+        num_letters=21,
+        node_features=hidden_dim,
+        edge_features=hidden_dim,
+        hidden_dim=hidden_dim,
+        num_encoder_layers=num_layers,
+        num_decoder_layers=num_layers,
+        augment_eps=backbone_noise,
+        k_neighbors=checkpoint["num_edges"],
+    )
+    model.to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model, device
 
 
 def get_pdb(pdb_code="", filepath=""):
     if pdb_code is None or pdb_code == "":
-        return filepath.name
+        try:
+            return filepath.name
+        except AttributeError as e:
+            return None
     else:
         os.system(f"wget -qnc https://files.rcsb.org/view/{pdb_code}.pdb")
         return f"{pdb_code}.pdb"
 
 
-def update(inp, file, designed_chain, fixed_chain, homomer, num_seqs, sampling_temp):
+def update(
+    inp,
+    file,
+    designed_chain,
+    fixed_chain,
+    homomer,
+    num_seqs,
+    sampling_temp,
+    model_name,
+    backbone_noise,
+):
     pdb_path = get_pdb(pdb_code=inp, filepath=file)
+
+    if pdb_path == None:
+        return "Error processing PDB"
+
+    model, device = setup_proteinmpnn(
+        model_name=model_name, backbone_noise=backbone_noise
+    )
+
     if designed_chain == "":
         designed_chain_list = []
     else:
@@ -369,12 +370,12 @@ def update(inp, file, designed_chain, fixed_chain, homomer, num_seqs, sampling_t
     chain_id_dict = {}
     chain_id_dict[pdb_dict_list[0]["name"]] = (designed_chain_list, fixed_chain_list)
     with torch.no_grad():
-        for ix, protein in enumerate(dataset_valid):
+        for ix, prot in enumerate(dataset_valid):
             score_list = []
             all_probs_list = []
             all_log_probs_list = []
             S_sample_list = []
-            batch_clones = [copy.deepcopy(protein) for i in range(BATCH_COPIES)]
+            batch_clones = [copy.deepcopy(prot) for i in range(BATCH_COPIES)]
             (
                 X,
                 S,
@@ -425,6 +426,7 @@ def update(inp, file, designed_chain, fixed_chain, homomer, num_seqs, sampling_t
             scores = _scores(S, log_probs, mask_for_loss)
             native_score = scores.cpu().data.numpy()
             message = ""
+            seq_list = []
             for temp in temperatures:
                 for j in range(NUM_BATCHES):
                     randn_2 = torch.randn(chain_M.shape, device=X.device)
@@ -568,6 +570,7 @@ def update(inp, file, designed_chain, fixed_chain, homomer, num_seqs, sampling_t
                         seq = "".join(
                             list(np.array(list_of_AAs)[np.argsort(masked_list)])
                         )
+                        # add non designed chains to predicted sequence
                         l0 = 0
                         for mc_length in list(
                             np.array(masked_chain_length_list)[np.argsort(masked_list)]
@@ -583,13 +586,35 @@ def update(inp, file, designed_chain, fixed_chain, homomer, num_seqs, sampling_t
                             unique=False,
                             precision=4,
                         )
+                        chain_s = ""
+                        if len(visible_list_list[0]) > 0:
+                            chain_M_bool = chain_M.bool()
+                            not_designed = _S_to_seq(S[b_ix], ~chain_M_bool[b_ix])
+
+                            labels = (
+                                chain_encoding_all[b_ix][~chain_M_bool[b_ix]]
+                                .detach()
+                                .cpu()
+                                .numpy()
+                            )
+
+                            for c in set(labels):
+                                chain_s += "/"
+                                nd_mask = labels == c
+                                for i, x in enumerate(not_designed):
+                                    if nd_mask[i]:
+                                        chain_s += x
                         line = (
                             ">T={}, sample={}, score={}, seq_recovery={}\n{}\n".format(
                                 temp, b_ix, score_print, seq_rec_print, seq
                             )
                         )
+                        seq_list.append(seq + chain_s)
                         message += f"{line}\n"
-
+    # somehow sequences still contain X, remove again
+    for i, x in enumerate(seq_list):
+        for aa in omit_AAs:
+            seq_list[i] = x.replace(aa, "")
     all_probs_concat = np.concatenate(all_probs_list)
     all_log_probs_concat = np.concatenate(all_log_probs_list)
     np.savetxt("all_probs_concat.csv", all_probs_concat.mean(0).T, delimiter=",")
@@ -623,37 +648,60 @@ def update(inp, file, designed_chain, fixed_chain, homomer, num_seqs, sampling_t
         gr.File.update(value="all_log_probs_concat.csv", visible=True),
         gr.File.update(value="all_probs_concat.csv", visible=True),
         pdb_path,
+        gr.Dropdown.update(choices=seq_list),
     )
 
 
-def update_AF(startsequence, pdb):
+def update_AF(startsequence, pdb, num_recycles):
 
     # # run alphafold using ray
-    plddts, pae, num_res = ray.get(run_alphafold.remote(startsequence))
+    plddts, pae, num_res = run_alphafold(
+        startsequence, num_recycles
+    )  # ray.get(run_alphafold.remote(startsequence))
     x = np.arange(10)
-
-    plotAF_plddt = go.Figure(
-        data=go.Scatter(
-            x=np.arange(len(plddts)),
-            y=plddts,
-            hovertemplate="<i>pLDDT</i>: %{y:.2f} <br><i>Residue index:</i> %{x}",
+    plots = []
+    for recycle, plddts_val in enumerate(plddts):
+        if recycle == 0 or recycle == len(plddts) - 1:
+            visible = True
+        else:
+            visible = "legendonly"
+        plots.append(
+            go.Scatter(
+                x=np.arange(len(plddts_val)),
+                y=plddts_val,
+                hovertemplate="<i>pLDDT</i>: %{y:.2f} <br><i>Residue index:</i> %{x}<br>Recycle "
+                + str(recycle),
+                name=f"Recycle {recycle}",
+                visible=visible,
+            )
         )
-    )
+    plotAF_plddt = go.Figure(data=plots)
     plotAF_plddt.update_layout(
         title="pLDDT",
         xaxis_title="Residue index",
         yaxis_title="pLDDT",
         height=500,
         template="simple_white",
+        legend=dict(yanchor="bottom", y=0.01, xanchor="left", x=0.99),
     )
+    plt.figure()
+    plt.title("Predicted Aligned Error")
+    Ln = pae.shape[0]
+    plt.imshow(pae, cmap="bwr", vmin=0, vmax=30, extent=(0, Ln, Ln, 0))
+    plt.colorbar()
+    plt.xlabel("Scored residue")
+    plt.ylabel("Aligned residue")
+    # doesnt work (likely because too large)
+    # plotAF_pae = px.imshow(
+    #     pae,
+    #     labels=dict(x="Scored residue", y="Aligned residue", color=""),
+    #     template="simple_white",
+    #     y=np.arange(len(plddts)),
+    # )
+    # plotAF_pae.write_html("test.html")
+    # plotAF_pae.update_layout(title="Predicted Aligned Error", template="simple_white")
 
-    plotAF_pae = px.imshow(
-        pae,
-        labels=dict(x="Scored residue", y="Aligned residue", color=""),
-    )
-    plotAF_pae.update_layout(title="Predicted Aligned Error", template="simple_white")
-
-    return molecule(pdb, "af_backprop/out.pdb", num_res), plotAF_plddt, plotAF_pae
+    return molecule(pdb, "out.pdb", num_res), plotAF_plddt, plt
 
 
 def read_mol(molpath):
@@ -667,9 +715,8 @@ def read_mol(molpath):
 
 def molecule(pdb, afpdb, num_res):
 
-    rms, aligned_pdb = align_structures(pdb, afpdb, num_res)
-
-    mol = read_mol(pdb)
+    rms, input_pdb, aligned_pdb = align_structures(pdb, afpdb, num_res)
+    mol = read_mol(input_pdb)
     pred_mol = read_mol(aligned_pdb)
     x = (
         """<!DOCTYPE html>
@@ -683,7 +730,7 @@ def molecule(pdb, afpdb, num_res):
     }
 .mol-container {
   width: 100%;
-  height: 800px;
+  height: 700px;
   position: relative;
 }
 .space-x-2 > * + *{
@@ -717,9 +764,16 @@ select{
     <div class="flex">
         <div class="px-4">
         <label for="sidechain" class="relative inline-flex items-center mb-4 cursor-pointer ">
-            <input  id="sidechain"type="checkbox" class="sr-only peer">
+            <input  id="sidechain" type="checkbox" class="sr-only peer">
             <div class="w-11 h-6 bg-gray-200 rounded-full peer peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 dark:bg-gray-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:absolute after:top-0.5 after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
             <span class="ml-3 text-sm font-medium text-gray-900 dark:text-gray-300">Show side chains</span>
+          </label>
+        </div>
+        <div class="px-4">
+        <label for="startstructure" class="relative inline-flex items-center mb-4 cursor-pointer ">
+            <input  id="startstructure" type="checkbox" class="sr-only peer" checked>
+            <div class="w-11 h-6 bg-gray-200 rounded-full peer peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 dark:bg-gray-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:absolute after:top-0.5 after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+            <span class="ml-3 text-sm font-medium text-gray-900 dark:text-gray-300">Show initial structure</span>
           </label>
         </div>
  <button type="button" class="text-gray-900 bg-white hover:bg-gray-100 border border-gray-200 focus:ring-4 focus:outline-none focus:ring-gray-100 font-medium rounded-lg text-sm px-5 py-2.5 text-center inline-flex items-center dark:focus:ring-gray-600 dark:bg-gray-800 dark:border-gray-700 dark:text-white dark:hover:bg-gray-700 mr-2 mb-2" id="download">
@@ -728,6 +782,9 @@ select{
                   </button>
             </div>       
 <div class="text-sm">
+<div> RMSD AlphaFold vs. native: """
+        + f"{rms:.2f}"
+        + """Å</div>
                             <div class="font-medium mt-4"><b>AlphaFold model confidence:</b></div>
                             <div class="flex space-x-2 py-1"><span class="w-4 h-4"
                                     style="background-color: rgb(0, 83, 214);">&nbsp;</span><span class="legendlabel">Very high
@@ -773,7 +830,8 @@ select{
                         return "Blue";
                     }
                 };
-                viewer.setStyle({}, { cartoon: { colorfunc: colorAlpha } });
+                viewer.getModel(1).setStyle({},{ cartoon: {color:"gray"} })
+                viewer.getModel(0).setStyle({}, { cartoon: { colorfunc: colorAlpha } });
                 viewer.zoomTo();
                 viewer.render();
                 viewer.zoom(0.8, 2000);
@@ -794,10 +852,26 @@ select{
                 $("#sidechain").change(function () {
                     if (this.checked) {
                         BB = ["C", "O", "N"]
-                        viewer.setStyle( {"and": [{resn: ["GLY", "PRO"], invert: true},{atom: BB, invert: true},]},{stick: {colorscheme: "WhiteCarbon", radius: 0.3}, cartoon: { colorfunc: colorAlpha }});
+                        viewer.getModel(0).setStyle( {"and": [{resn: ["GLY", "PRO"], invert: true},{atom: BB, invert: true},]},{stick: {colorscheme: "WhiteCarbon", radius: 0.3}, cartoon: { colorfunc: colorAlpha }});
+                        viewer.getModel(1).setStyle( {"and": [{resn: ["GLY", "PRO"], invert: true},{atom: BB, invert: true},]},{stick: {colorscheme: "WhiteCarbon", radius: 0.3}, cartoon: { color: "gray" }});
                         viewer.render()
                     } else {
-                        viewer.setStyle({cartoon: { colorfunc: colorAlpha }});
+                        viewer.getModel(0).setStyle({cartoon: { colorfunc: colorAlpha }});
+                        viewer.getModel(1).setStyle({cartoon: { color:"gray" }});
+                        viewer.render()
+                    }
+                });
+
+                $("#startstructure").change(function () {
+                    if (this.checked) {
+                         $("#sidechain").prop( "checked", false );
+                       viewer.getModel(1).setStyle({},{ cartoon: {color:"gray"} })
+                       viewer.getModel(0).setStyle({}, { cartoon: { colorfunc: colorAlpha } });
+                       viewer.render()
+                    } else {
+                        $("#sidechain").prop( "checked", false );
+                       viewer.getModel(1).setStyle({},{})
+                       viewer.getModel(0).setStyle({}, { cartoon: { colorfunc: colorAlpha } });
                         viewer.render()
                     }
                 });
@@ -820,7 +894,7 @@ select{
         </body></html>"""
     )
 
-    return f"""<iframe style="width: 800px; height: 1200px" name="result" allow="midi; geolocation; microphone; camera; 
+    return f"""<iframe style="width: 800px; height: 1000px" name="result" allow="midi; geolocation; microphone; camera; 
     display-capture; encrypted-media;" sandbox="allow-modals allow-forms 
     allow-scripts allow-same-origin allow-popups 
     allow-top-navigation-by-user-activation allow-downloads" allowfullscreen="" 
@@ -856,7 +930,7 @@ with proteinMPNN:
             inp = gr.Textbox(
                 placeholder="PDB Code or upload file below", label="Input structure"
             )
-            file = gr.File(file_count="single", type="file")
+            file = gr.File(file_count="single")
 
         with gr.TabItem("Settings"):
             with gr.Row():
@@ -872,6 +946,20 @@ with proteinMPNN:
                     choices=[0.1, 0.15, 0.2, 0.25, 0.3],
                     value=0.1,
                     label="Sampling temperature",
+                )
+            with gr.Row():
+                model_name = gr.Dropdown(
+                    choices=[
+                        "v_48_002",
+                        "v_48_010",
+                        "v_48_020",
+                        "v_48_030",
+                    ],
+                    label="Model",
+                    value="v_48_020",
+                )
+                backbone_noise = gr.Dropdown(
+                    choices=[0, 0.02, 0.10, 0.20, 0.30], label="Backbone noise", value=0
                 )
             with gr.Row():
                 homomer = gr.Checkbox(value=False, label="Homomer?")
@@ -916,17 +1004,39 @@ with proteinMPNN:
             plot_tadjusted = gr.Plot()
             all_probs = gr.File(visible=False)
         with gr.TabItem("Structure validation w/ AF2"):
-            # gr.Markdown("Coming soon")
+            gr.HTML(
+                """
+            <div class="flex items-center p-2 bg-gradient-to-r from-yellow-400 via-red-500 to-pink-500 rounded-lg shadow-sm">
+                <div class="p-3 mr-4">
+                <svg class="w-10 h-10 px-1 text-400" viewBox="0 0 16 16">
+                    <path fill-rule="evenodd" d="M1.75 1.5a.25.25 0 00-.25.25v9.5c0 .138.112.25.25.25h2a.75.75 0 01.75.75v2.19l2.72-2.72a.75.75 0 01.53-.22h6.5a.25.25 0 00.25-.25v-9.5a.25.25 0 00-.25-.25H1.75zM0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v9.5A1.75 1.75 0 0114.25 13H8.06l-2.573 2.573A1.457 1.457 0 013 14.543V13H1.75A1.75 1.75 0 010 11.25v-9.5zM9 9a1 1 0 11-2 0 1 1 0 012 0zm-.25-5.25a.75.75 0 00-1.5 0v2.5a.75.75 0 001.5 0v-2.5z"></path>
+                </svg>
+                </div>
+                <div>
+                <p class="text-base text-gray-700 dark:text-gray-200">
+                    AF2 code is experimental and relies on @sokrypton's trick to speed up compile/module runtime. Results might differ from DeepMind's published results.
+                    Predictions are made using <code>model_5_ptm</code> and without MSA based on the selected single sequence (<code>designed_chain</code> + <code>fixed_chain</code>).
+                </p>
+                </div>
+                </div>
+            """
+            )
             with gr.Row():
-                chosen_seq = gr.Textbox(
-                    label="Copy and paste a sequence for validation"
-                )
+                with gr.Row():
+                    chosen_seq = gr.Dropdown(
+                        choices=[], label="Select a sequence for validation"
+                    )
+                    num_recycles = gr.Dropdown(
+                        choices=[0, 1, 3, 5], value=3, label="num Recycles"
+                    )
                 btnAF = gr.Button("Run AF2 on sequence")
-            mol = gr.HTML()
             with gr.Row():
-                plotAF_plddt = gr.Plot(label="pLDDT")
-                plotAF_pae = gr.Plot(label="PAE")
-    file = gr.Variable()
+                mol = gr.HTML()
+                with gr.Column():
+                    plotAF_plddt = gr.Plot(label="pLDDT")
+                    # remove maxh80 class from css
+                    plotAF_pae = gr.Plot(label="PAE")
+    tempFile = gr.Variable()
     btn.click(
         fn=update,
         inputs=[
@@ -937,12 +1047,22 @@ with proteinMPNN:
             homomer,
             num_seqs,
             sampling_temp,
+            model_name,
+            backbone_noise,
         ],
-        outputs=[out, plot, plot_tadjusted, all_log_probs, all_probs, file],
+        outputs=[
+            out,
+            plot,
+            plot_tadjusted,
+            all_log_probs,
+            all_probs,
+            tempFile,
+            chosen_seq,
+        ],
     )
     btnAF.click(
         fn=update_AF,
-        inputs=[chosen_seq, file],
+        inputs=[chosen_seq, tempFile, num_recycles],
         outputs=[mol, plotAF_plddt, plotAF_pae],
     )
     examples.click(fn=set_examples, inputs=examples, outputs=examples.components)
@@ -953,6 +1073,6 @@ bioRxiv 2022.06.03.494563; doi: [10.1101/2022.06.03.494563](https://doi.org/10.1
     )
 
 
-#ray.init(runtime_env={"working_dir": "./"})
+# ray.init(runtime_env={"working_dir": "./af_backprop"})
 
-proteinMPNN.launch()
+proteinMPNN.launch(share=True, debug=True)
