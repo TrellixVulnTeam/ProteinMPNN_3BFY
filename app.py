@@ -250,7 +250,7 @@ def setup_proteinmpnn(model_name="v_48_020", backbone_noise=0.00):
     )
     from protein_mpnn_utils import StructureDataset, StructureDatasetPDB, ProteinMPNN
 
-    device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
+    device = torch.device("cpu") #torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu") #fix for memory issues
     # ProteinMPNN model name: v_48_002, v_48_010, v_48_020, v_48_030, v_32_002, v_32_010; v_32_020, v_32_030; v_48_010=version with 48 edges 0.10A noise
     # Standard deviation of Gaussian noise to add to backbone atoms
     hidden_dim = 128
