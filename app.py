@@ -26,6 +26,9 @@ import urllib
 import jax.numpy as jnp
 import tensorflow as tf
 
+
+from moleculekit.molecule import Molecule
+
 if "/home/user/app/af_backprop" not in sys.path:
     sys.path.append("/home/user/app/af_backprop")
 
@@ -250,7 +253,9 @@ def setup_proteinmpnn(model_name="v_48_020", backbone_noise=0.00):
     )
     from protein_mpnn_utils import StructureDataset, StructureDatasetPDB, ProteinMPNN
 
-    device = torch.device("cpu") #torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu") #fix for memory issues
+    device = torch.device(
+        "cpu"
+    )  # torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu") #fix for memory issues
     # ProteinMPNN model name: v_48_002, v_48_010, v_48_020, v_48_030, v_32_002, v_32_010; v_32_020, v_32_030; v_48_010=version with 48 edges 0.10A noise
     # Standard deviation of Gaussian noise to add to backbone atoms
     hidden_dim = 128
@@ -291,6 +296,61 @@ def get_pdb(pdb_code="", filepath=""):
         return f"{pdb_code}.pdb"
 
 
+def preprocess_mol(pdb_code="", filepath=""):
+    if pdb_code is None or pdb_code == "":
+        try:
+            mol = Molecule(filepath.name)
+        except AttributeError as e:
+            return None
+    else:
+        mol = Molecule(pdb_code)
+    mol.write('original.pdb')
+    # clean messy files and only include protein itself
+    mol.filter("protein")
+    # renumber using moleculekit 0...len(protein)
+    df = mol.renumberResidues(returnMapping=True)
+    # add proteinMPNN index col which used 1..len(chain), 1...len(chain)
+    indexes = []
+    for chain, g in df.groupby("chain"):
+        j = 1
+        for i, row in g.iterrows():
+            indexes.append(j)
+            j += 1
+    df["proteinMPNN_index"] = indexes
+    mol.write("cleaned.pdb")
+    return "cleaned.pdb", df
+
+def make_fixed_positions_dict(atomsel, residue_index_df):
+    # we use the uploaded file for the selection
+    mol = Molecule('original.pdb')
+    # use index for selection as resids will change
+    selected_residues = mol.get("index",atomsel)
+
+    # clean up
+    mol.filter("protein")
+    mol.renumberResidues()
+    # based on selected index now get resids
+    selected_residues = [str(i) for i in selected_residues]
+    if len(selected_residues)==0:
+        return None, []
+    selected_residues_str = " ".join(selected_residues)
+    selected_residues=set(mol.get('resid', sel=f"index {selected_residues_str}"))
+
+    # use the proteinMPNN index nomenclature to assemble fixed_positions_dict
+    fixed_positions_df = residue_index_df[residue_index_df['new_resid'].isin(selected_residues)]
+
+    chains = set(mol.get('chain', sel="all"))
+    fixed_position_dict = {'cleaned':{}}
+    #store the selected residues in a list for the visualization later with cleaned.pdb
+    selected_residues = list(fixed_positions_df['new_resid'])
+
+    for c in chains:
+        fixed_position_dict['cleaned'][c]=[]
+
+    for i, row in fixed_positions_df.iterrows():
+        fixed_position_dict['cleaned'][row['chain']].append(row['proteinMPNN_index'])
+    return fixed_position_dict, selected_residues
+
 def update(
     inp,
     file,
@@ -301,6 +361,7 @@ def update(
     sampling_temp,
     model_name,
     backbone_noise,
+    atomsel
 ):
     from protein_mpnn_utils import (
         loss_nll,
@@ -316,7 +377,9 @@ def update(
     )
     from protein_mpnn_utils import StructureDataset, StructureDatasetPDB, ProteinMPNN
 
-    pdb_path = get_pdb(pdb_code=inp, filepath=file)
+    # pdb_path = get_pdb(pdb_code=inp, filepath=file)
+
+    pdb_path, mol_index = preprocess_mol(pdb_code=inp, filepath=file)
 
     if pdb_path == None:
         return "Error processing PDB"
@@ -368,7 +431,11 @@ def update(
     omit_AAs_np = np.array([AA in omit_AAs_list for AA in alphabet]).astype(np.float32)
 
     chain_id_dict = None
-    fixed_positions_dict = None
+    if atomsel == "":
+        fixed_positions_dict, selected_residues = None, []
+    else:
+        fixed_positions_dict, selected_residues=make_fixed_positions_dict(atomsel, mol_index)
+    
     pssm_dict = None
     omit_AA_dict = None
     bias_AA_dict = None
@@ -385,6 +452,7 @@ def update(
         tied_positions_dict = make_tied_positions_for_homomers(pdb_dict_list)
     else:
         tied_positions_dict = None
+    
     chain_id_dict = {}
     chain_id_dict[pdb_dict_list[0]["name"]] = (designed_chain_list, fixed_chain_list)
     with torch.no_grad():
@@ -629,6 +697,8 @@ def update(
                         )
                         seq_list.append(seq + chain_s)
                         message += f"{line}\n"
+
+    message += f"\nfixed positions:* {fixed_positions_dict['cleaned']} \n\n*uses CHAIN:[1..len(chain)] residue numbering"
     # somehow sequences still contain X, remove again
     for i, x in enumerate(seq_list):
         for aa in omit_AAs:
@@ -667,10 +737,11 @@ def update(
         gr.File.update(value="all_probs_concat.csv", visible=True),
         pdb_path,
         gr.Dropdown.update(choices=seq_list),
+        selected_residues
     )
 
 
-def update_AF(startsequence, pdb, num_recycles):
+def update_AF(startsequence, pdb, num_recycles,selectedResidues):
 
     # # run alphafold using ray
     # plddts, pae, num_res = run_alphafold(
@@ -720,17 +791,19 @@ def update_AF(startsequence, pdb, num_recycles):
     plt.colorbar()
     plt.xlabel("Scored residue")
     plt.ylabel("Aligned residue")
+    plt.savefig("pae_plot.png", dpi=300)
+    plt.close()
     # doesnt work (likely because too large)
     # plotAF_pae = px.imshow(
     #     pae,
     #     labels=dict(x="Scored residue", y="Aligned residue", color=""),
     #     template="simple_white",
-    #     y=np.arange(len(plddts)),
+    #     y=np.arange(len(plddts_val)),
     # )
     # plotAF_pae.write_html("test.html")
     # plotAF_pae.update_layout(title="Predicted Aligned Error", template="simple_white")
 
-    return molecule(pdb, "out.pdb", num_res), plotAF_plddt, plt
+    return molecule(pdb, "out.pdb", num_res, selectedResidues), plotAF_plddt, "pae_plot.png"
 
 
 def read_mol(molpath):
@@ -742,7 +815,7 @@ def read_mol(molpath):
     return mol
 
 
-def molecule(pdb, afpdb, num_res):
+def molecule(pdb, afpdb, num_res, selectedResidues):
 
     rms, input_pdb, aligned_pdb = align_structures(pdb, afpdb, num_res)
     mol = read_mol(input_pdb)
@@ -767,10 +840,6 @@ def molecule(pdb, afpdb, num_res):
 }
 .p-1{
     padding:0.5rem;
-}
-.flex{
-    display:flex;
-    align-items: center;
 }
 .w-4{
     width:1rem;
@@ -802,7 +871,7 @@ select{
         <label for="startstructure" class="relative inline-flex items-center mb-4 cursor-pointer ">
             <input  id="startstructure" type="checkbox" class="sr-only peer" checked>
             <div class="w-11 h-6 bg-gray-200 rounded-full peer peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 dark:bg-gray-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:absolute after:top-0.5 after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
-            <span class="ml-3 text-sm font-medium text-gray-900 dark:text-gray-300">Show initial structure</span>
+            <span class="ml-3 text-sm font-medium text-gray-900 dark:text-gray-300">Show input structure</span>
           </label>
         </div>
  <button type="button" class="text-gray-900 bg-white hover:bg-gray-100 border border-gray-200 focus:ring-4 focus:outline-none focus:ring-gray-100 font-medium rounded-lg text-sm px-5 py-2.5 text-center inline-flex items-center dark:focus:ring-gray-600 dark:bg-gray-800 dark:border-gray-700 dark:text-white dark:hover:bg-gray-700 mr-2 mb-2" id="download">
@@ -814,23 +883,31 @@ select{
 <div> RMSD AlphaFold vs. native: """
         + f"{rms:.2f}"
         + """Å computed using CEAlign on the aligned fragment</div>
-                            <div class="font-medium mt-4"><b>AlphaFold model confidence:</b></div>
-                            <div class="flex space-x-2 py-1"><span class="w-4 h-4"
-                                    style="background-color: rgb(0, 83, 214);">&nbsp;</span><span class="legendlabel">Very high
+                        </div>
+<div class="text-sm flex items-start">
+                <div class="w-1/2">
+                        
+                            <div class="font-medium mt-4 flex items-center space-x-2"><b>AF2 model of redesigned sequence</b></div>
+                            <div>AlphaFold model confidence:</div>
+                            <div class="flex space-x-2 py-1"><span class="w-4 h-4" style="background-color: rgb(0, 83, 214);">&nbsp;</span><span class="legendlabel">Very high
                                     (pLDDT &gt; 90)</span></div>
-                            <div class="flex space-x-2 py-1"><span class="w-4 h-4"
-                                    style="background-color: rgb(101, 203, 243);">&nbsp;</span><span class="legendlabel">Confident
+                            <div class="flex space-x-2 py-1"><span class="w-4 h-4" style="background-color: rgb(101, 203, 243);">&nbsp;</span><span class="legendlabel">Confident
                                     (90 &gt; pLDDT &gt; 70)</span></div>
-                            <div class="flex space-x-2 py-1"><span class="w-4 h-4"
-                                    style="background-color: rgb(255, 219, 19);">&nbsp;</span><span class="legendlabel">Low (70 &gt;
+                            <div class="flex space-x-2 py-1"><span class="w-4 h-4" style="background-color: rgb(255, 219, 19);">&nbsp;</span><span class="legendlabel">Low (70 &gt;
                                     pLDDT &gt; 50)</span></div>
-                            <div class="flex space-x-2 py-1"><span class="w-4 h-4"
-                                    style="background-color: rgb(255, 125, 69);">&nbsp;</span><span class="legendlabel">Very low
+                            <div class="flex space-x-2 py-1"><span class="w-4 h-4" style="background-color: rgb(255, 125, 69);">&nbsp;</span><span class="legendlabel">Very low
                                     (pLDDT &lt; 50)</span></div>
                             <div class="row column legendDesc"> AlphaFold produces a per-residue confidence
                                 score (pLDDT) between 0 and 100. Some regions below 50 pLDDT may be unstructured in isolation.
                             </div>
                         </div>
+                        <div class="w-1/2">
+                            <div class="font-medium mt-4 flex items-center space-x-2"><b>Input structure </b><span class="w-4 h-4 bg-gray-300 inline-flex" ></span></div>
+                            
+                            <div class="flex space-x-2 py-1"><span class="w-4 h-4" style="background-color:hotpink" >&nbsp;</span><span class="legendlabel">Fixed positions</span></div>
+
+                        </div>
+                    </div>
             <script>
             let viewer = null;
             let voldata = null;
@@ -859,14 +936,38 @@ select{
                         return "Blue";
                     }
                 };
-                viewer.getModel(1).setStyle({},{ cartoon: {color:"gray"} })
+                var selectedResidues = """+
+                f"{selectedResidues}"
+                +"""
+                let colors = {}
+                for (let i=0; i<"""+str(num_res)+""";i++){
+                if (selectedResidues.includes(i)){
+                    colors[i]="hotpink"
+                }else{
+                    colors[i]="lightgray"
+                }}
+
+                let colorFixedSidechain = function(atom){
+                                if (selectedResidues.includes(atom.resi)){
+                                    return "hotpink"
+                                }else if (atom.elem == "O"){
+                                    return "red"
+                                }else if (atom.elem == "N"){
+                                    return "blue"
+                                }else if (atom.elem == "S"){
+                                    return "yellow"
+                                }else{
+                                    return "lightgray"
+                                }
+                            }
+
+                viewer.getModel(1).setStyle({},{ cartoon: {colorscheme:{prop:"resi",map:colors} } })
                 viewer.getModel(0).setStyle({}, { cartoon: { colorfunc: colorAlpha } });
                 viewer.zoomTo();
                 viewer.render();
                 viewer.zoom(0.8, 2000);
                 viewer.getModel(0).setHoverable({}, true,
                     function (atom, viewer, event, container) {
-                        console.log(atom)
                         if (!atom.label) {
                             atom.label = viewer.addLabel(atom.resn+atom.resi+" pLDDT=" + atom.b, { position: atom, backgroundColor: "mintcream", fontColor: "black" });
                         }
@@ -881,12 +982,24 @@ select{
                 $("#sidechain").change(function () {
                     if (this.checked) {
                         BB = ["C", "O", "N"]
-                        viewer.getModel(0).setStyle( {"and": [{resn: ["GLY", "PRO"], invert: true},{atom: BB, invert: true},]},{stick: {colorscheme: "WhiteCarbon", radius: 0.3}, cartoon: { colorfunc: colorAlpha }});
-                        viewer.getModel(1).setStyle( {"and": [{resn: ["GLY", "PRO"], invert: true},{atom: BB, invert: true},]},{stick: {colorscheme: "WhiteCarbon", radius: 0.3}, cartoon: { color: "gray" }});
+                        
+                        if ($("#startstructure").prop("checked")) {
+                            viewer.getModel(0).setStyle( {"and": [{resn: ["GLY", "PRO"], invert: true},{atom: BB, invert: true},]},{stick: {colorscheme: "WhiteCarbon", radius: 0.3}, cartoon: { colorfunc: colorAlpha }});
+                            viewer.getModel(1).setStyle( {"and": [{resn: ["GLY", "PRO"], invert: true},{atom: BB, invert: true},]},{stick: {colorfunc:colorFixedSidechain, radius: 0.3}, cartoon: {colorscheme:{prop:"resi",map:colors} }});
+                        }else{
+                            viewer.getModel(0).setStyle( {"and": [{resn: ["GLY", "PRO"], invert: true},{atom: BB, invert: true},]},{stick: {colorscheme: "WhiteCarbon", radius: 0.3}, cartoon: { colorfunc: colorAlpha }});
+                            viewer.getModel(1).setStyle();                        
+                        }
+                        
                         viewer.render()
                     } else {
+                        if ($("#startstructure").prop("checked")) {
                         viewer.getModel(0).setStyle({cartoon: { colorfunc: colorAlpha }});
-                        viewer.getModel(1).setStyle({cartoon: { color:"gray" }});
+                        viewer.getModel(1).setStyle({cartoon: {colorscheme:{prop:"resi",map:colors} }});
+                        }else{
+                            viewer.getModel(0).setStyle({cartoon: { colorfunc: colorAlpha }});
+                            viewer.getModel(1).setStyle();
+                            }
                         viewer.render()
                     }
                 });
@@ -894,7 +1007,7 @@ select{
                 $("#startstructure").change(function () {
                     if (this.checked) {
                          $("#sidechain").prop( "checked", false );
-                       viewer.getModel(1).setStyle({},{ cartoon: {color:"gray"} })
+                       viewer.getModel(1).setStyle({},{cartoon: {colorscheme:{prop:"resi",map:colors} } })
                        viewer.getModel(0).setStyle({}, { cartoon: { colorfunc: colorAlpha } });
                        viewer.render()
                     } else {
@@ -931,7 +1044,7 @@ select{
 
 
 def set_examples(example):
-    label, inp, designed_chain, fixed_chain, homomer, num_seqs, sampling_temp = example
+    label, inp, designed_chain, fixed_chain, homomer, num_seqs, sampling_temp, atomsel = example
     return [
         label,
         inp,
@@ -940,6 +1053,7 @@ def set_examples(example):
         homomer,
         gr.Slider.update(value=num_seqs),
         gr.Radio.update(value=sampling_temp),
+        atomsel
     ]
 
 
@@ -976,6 +1090,9 @@ with proteinMPNN:
                     value=0.1,
                     label="Sampling temperature",
                 )
+            gr.Markdown(""" Sampling temperature for amino acids, `T=0.0` means taking argmax, `T>>1.0` means sample randomly. Suggested values `0.1, 0.15, 0.2, 0.25, 0.3`. Higher values will lead to more diversity.
+            """
+            )
             with gr.Row():
                 model_name = gr.Dropdown(
                     choices=[
@@ -995,6 +1112,17 @@ with proteinMPNN:
                 gr.Markdown(
                     "for correct symmetric tying lenghts of homomer chains should be the same"
                 )
+            gr.Markdown('## Fixed positions')
+            gr.Markdown("""You can fix important positions in the protein. Resid should be specified with the same numbering as in the input pdb file. The fixed residues will be highlighted in the output. 
+                The [VMD selection](http://www.ks.uiuc.edu/Research/vmd/vmd-1.9.2/ug/node89.html) synthax is used. You can also select based on ligands or chains in the input structure to specify interfaces to be fixed.
+
+                 - <code>within 5 of resid 94</code> All residues that have >1 atom closer than 5 Å to any atom of residue 94
+                 - <code>name CA and within 5 of resid 94</code> All residues that have CA atom closer than 5 Å to any atom of residue 94
+                 - <code>resid 94 96 119</code> Residues 94, 94 and 119
+                 - <code>within 5 of resname ZN</code> All residues with any atom <5 Å of zinc ion
+                 - <code>chain A and within 5 of chain B </code> All residues of chain A that are part of the interface with chain B
+                 - <code>protein and within 5 of nucleic </code> All residues that bind to DNA (if present in structure)""")
+            atomsel = gr.Textbox(placeholder="Specify atom selection ", label="Fixed positions")
 
         btn = gr.Button("Run")
     label = gr.Textbox(label="Label", visible=False)
@@ -1007,17 +1135,17 @@ with proteinMPNN:
             homomer,
             num_seqs,
             sampling_temp,
+            atomsel
         ],
         samples=[
-            ["Homomer design", "1O91", "A,B,C", "", True, 2, 0.1],
-            ["Monomer design", "6MRR", "A", "", False, 2, 0.1],
-            ["Redesign of Homomer to Heteromer", "3HTN", "A,B", "C", False, 2, 0.1],
+            ["Homomer design", "1O91", "A,B,C", "", True, 2, 0.1,""],
+            ["Monomer design", "6MRR", "A", "", False, 2, 0.1,""],
+            ["Redesign of Homomer to Heteromer", "3HTN", "A,B", "C", False, 2, 0.1, ""],
+            ["Redesign of MID1 scaffold keeping binding site fixed", "3V1C", "A,B", "", False, 2, 0.1, "within 5 of resname ZN"],
+            ["Redesign of DNA binding protein", "3JRD", "A,B", "", False, 2, 0.1, "within 8 of nucleic"],
         ],
     )
-    gr.Markdown(
-        """ Sampling temperature for amino acids, `T=0.0` means taking argmax, `T>>1.0` means sample randomly. Suggested values `0.1, 0.15, 0.2, 0.25, 0.3`. Higher values will lead to more diversity.
-    """
-    )
+
 
     gr.Markdown("# Output")
 
@@ -1064,8 +1192,9 @@ with proteinMPNN:
                 with gr.Column():
                     plotAF_plddt = gr.Plot(label="pLDDT")
                     # remove maxh80 class from css
-                    plotAF_pae = gr.Plot(label="PAE")
+                    plotAF_pae = gr.Image(label="PAE") #gr.Plot(label="PAE")
     tempFile = gr.Variable()
+    selectedResidues = gr.Variable()
     btn.click(
         fn=update,
         inputs=[
@@ -1078,6 +1207,7 @@ with proteinMPNN:
             sampling_temp,
             model_name,
             backbone_noise,
+            atomsel,
         ],
         outputs=[
             out,
@@ -1087,11 +1217,12 @@ with proteinMPNN:
             all_probs,
             tempFile,
             chosen_seq,
+            selectedResidues
         ],
     )
     btnAF.click(
         fn=update_AF,
-        inputs=[chosen_seq, tempFile, num_recycles],
+        inputs=[chosen_seq, tempFile, num_recycles, selectedResidues],
         outputs=[mol, plotAF_plddt, plotAF_pae],
     )
     examples.click(fn=set_examples, inputs=examples, outputs=examples.components)
