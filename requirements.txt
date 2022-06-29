@@ -20,5 +20,5 @@ tqdm
 gradio==3.0.11
 protobuf<4
 moleculekit
---use-deprecated=legacy-resolver
 -f https://storage.googleapis.com/jax-releases/jax_releases.html
+--resolver=legacy
