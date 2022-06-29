@@ -6,7 +6,7 @@ dm-haiku==0.0.5
 dm-tree==0.1.6
 docker==5.0.0
 immutabledict==2.0.0
-jax[cuda]==0.3.8
+jax[cuda]
 jaxlib==0.3.7
 ml-collections==0.1.0
 numpy==1.19.5
