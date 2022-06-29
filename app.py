@@ -332,7 +332,7 @@ def make_fixed_positions_dict(atomsel, residue_index_df):
     # based on selected index now get resids
     selected_residues = [str(i) for i in selected_residues]
     if len(selected_residues)==0:
-        return None, []
+        return {'cleaned':{}}, []
     selected_residues_str = " ".join(selected_residues)
     selected_residues=set(mol.get('resid', sel=f"index {selected_residues_str}"))
 
