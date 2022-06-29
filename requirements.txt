@@ -5,8 +5,8 @@ dm-haiku==0.0.5
 dm-tree==0.1.6
 docker==5.0.0
 immutabledict==2.0.0
-jax[cuda]
-jaxlib
+jax[cuda]==0.3.8
+jaxlib==0.3.7
 ml-collections==0.1.0
 numpy==1.19.5
 pandas==1.3.4
@@ -19,4 +19,5 @@ ray
 tqdm
 gradio==3.0.11
 protobuf<4
+git+https://github.com/Acellera/moleculekit.git
 -f https://storage.googleapis.com/jax-releases/jax_releases.html
